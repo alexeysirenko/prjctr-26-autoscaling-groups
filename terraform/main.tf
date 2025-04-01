@@ -528,6 +528,37 @@ resource "aws_ecs_service" "service" {
   }
 }
 
+resource "aws_appautoscaling_target" "ecs_target" {
+  max_capacity       = var.max_tasks
+  min_capacity       = var.min_tasks
+  resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.service.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+
+  depends_on = [
+    aws_ecs_service.service,
+    aws_ecs_capacity_provider.main
+  ]
+}
+
+resource "aws_appautoscaling_policy" "cpu_scaling" {
+  name               = "${var.name_tag}-cpu-scaling-policy"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.ecs_target.resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs_target.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs_target.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+
+    target_value       = 70.0  # Target CPU utilization percentage
+    scale_in_cooldown  = 300   # 5 minutes
+    scale_out_cooldown = 60    # 1 minute
+  }
+}
+
 output "alb_dns_name" {
   description = "Public DNS name of the ALB"
   value       = aws_lb.application_load_balancer.dns_name
