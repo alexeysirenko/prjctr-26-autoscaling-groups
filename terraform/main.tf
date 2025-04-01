@@ -1,13 +1,18 @@
 locals {
-  cluster_name                    = "${var.name_tag}-fargate-cluster"
+  cluster_name                    = "${var.name_tag}-ec2-cluster"
   application_load_balancer_name  = "${var.name_tag}-alb"
   aws_lb_target_group_name        = "${var.name_tag}-target-group"
   ecs_task_execution_role_name    = "${var.name_tag}-execution-role"
   ecs_task_role_name              = "${var.name_tag}-task-role"
+  ecs_instance_role_name          = "${var.name_tag}-instance-role"
+  ecs_instance_profile_name       = "${var.name_tag}-instance-profile"
   ecs_execution_policy_name       = "${var.name_tag}-policy"
   ecs_task_definition_family      = "${var.name_tag}-task-family"
   container_name                  = "${var.name_tag}-container"
   ecs_service_name                = "${var.name_tag}-service"
+  capacity_provider_name          = "${var.name_tag}-capacity-provider"
+  asg_name                        = "${var.name_tag}-asg"
+  launch_template_name            = "${var.name_tag}-launch-template"
 }
 
 provider "aws" {
@@ -18,14 +23,30 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
+# Get latest Amazon ECS-optimized AMI
+data "aws_ami" "ecs_optimized" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-ecs-hvm-*-x86_64-ebs"]
+  }
+
+  filter {
+    name   = "owner-alias"
+    values = ["amazon"]
+  }
+}
+
 resource "aws_vpc" "main" {
   cidr_block           = var.vpc_cidr_block
   enable_dns_support   = true
   enable_dns_hostnames = true
 
   tags = {
-    Name        = "${var.name_tag}-vpc"
-    ManagedBy   = "Terraform"
+    Name      = "${var.name_tag}-vpc"
+    ManagedBy = "Terraform"
   }
 }
 
@@ -40,9 +61,9 @@ resource "aws_internet_gateway" "main" {
 resource "aws_subnet" "public_subnets" {
   count = length(var.public_subnet_cidrs)
 
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = element(var.public_subnet_cidrs, count.index)
-  availability_zone = element(data.aws_availability_zones.available.names, count.index)
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = element(var.public_subnet_cidrs, count.index)
+  availability_zone       = element(data.aws_availability_zones.available.names, count.index)
   map_public_ip_on_launch = true
 
   tags = {
@@ -51,7 +72,7 @@ resource "aws_subnet" "public_subnets" {
 }
 
 resource "aws_eip" "nat_gateway" {
-  vpc = true
+  domain = "vpc"
   tags = {
     Name = "${var.name_tag}-nat-gateway-eip"
   }
@@ -110,7 +131,7 @@ resource "aws_route_table" "private" {
   vpc_id = aws_vpc.main.id
 
   route {
-    cidr_block = "0.0.0.0/0"
+    cidr_block     = "0.0.0.0/0"
     nat_gateway_id = aws_nat_gateway.main.id
   }
 
@@ -125,16 +146,16 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private.id
 }
 
-resource "aws_security_group" "ecs_task_sg" {
-  name_prefix = "${var.name_tag}-ecs-task-sg-"
-  description = "Security group for ECS tasks"
+resource "aws_security_group" "ecs_instance_sg" {
+  name_prefix = "${var.name_tag}-ecs-instance-sg-"
+  description = "Security group for ECS EC2 instances"
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    from_port   = var.app_port 
-    to_port     = var.app_port
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    from_port       = 0
+    to_port         = 65535
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb_sg.id]
   }
 
   egress {
@@ -145,7 +166,7 @@ resource "aws_security_group" "ecs_task_sg" {
   }
 
   tags = {
-    Name = "${var.name_tag}-ecs-task-sg"
+    Name = "${var.name_tag}-ecs-instance-sg"
   }
 }
 
@@ -156,7 +177,7 @@ resource "aws_security_group" "alb_sg" {
 
   ingress {
     from_port   = var.host_port
-    to_port     = var.app_port
+    to_port     = var.host_port # var.host_port
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -173,10 +194,35 @@ resource "aws_security_group" "alb_sg" {
   }
 }
 
-resource "aws_ecs_cluster" "main" {
-  name = local.cluster_name
+# IAM Role for EC2 instances
+resource "aws_iam_role" "ecs_instance_role" {
+  name = local.ecs_instance_role_name
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        },
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
 }
 
+resource "aws_iam_role_policy_attachment" "ecs_ec2_role" {
+  role       = aws_iam_role.ecs_instance_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+}
+
+resource "aws_iam_instance_profile" "ecs_instance_profile" {
+  name = local.ecs_instance_profile_name
+  role = aws_iam_role.ecs_instance_role.name
+}
+
+# ECS Task Role
 resource "aws_iam_role" "ecs_task_role" {
   name = local.ecs_task_role_name
 
@@ -194,6 +240,7 @@ resource "aws_iam_role" "ecs_task_role" {
   })
 }
 
+# ECS Task Execution Role
 resource "aws_iam_role" "ecs_task_execution_role" {
   name = local.ecs_task_execution_role_name
 
@@ -211,13 +258,13 @@ resource "aws_iam_role" "ecs_task_execution_role" {
   })
 
   inline_policy {
-    name   = local.ecs_execution_policy_name
+    name = local.ecs_execution_policy_name
     policy = jsonencode({
       Version = "2012-10-17",
       Statement = [
         {
-          Effect   = "Allow",
-          Action   = [
+          Effect = "Allow",
+          Action = [
             "ecr:GetAuthorizationToken",
             "ecr:BatchCheckLayerAvailability",
             "ecr:GetDownloadUrlForLayer",
@@ -237,19 +284,134 @@ resource "aws_iam_role_policy_attachment" "ecs_task_execution_policy" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+# CloudWatch Log Group for ECS
 resource "aws_cloudwatch_log_group" "ecs_log_group" {
   name              = "/ecs/${var.name_tag}/${local.container_name}"
   retention_in_days = 7
 
   tags = {
-    Service     = local.ecs_service_name
+    Service = local.ecs_service_name
+  }
+}
+
+# ECS Cluster
+resource "aws_ecs_cluster" "main" {
+  name = local.cluster_name
+}
+
+# Launch Template
+resource "aws_launch_template" "ecs" {
+  name          = local.launch_template_name
+  image_id      = data.aws_ami.ecs_optimized.id
+  instance_type = var.instance_type
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ecs_instance_profile.name
+  }
+
+  vpc_security_group_ids = [aws_security_group.ecs_instance_sg.id]
+
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    echo ECS_CLUSTER=${aws_ecs_cluster.main.name} >> /etc/ecs/ecs.config
+    echo ECS_ENABLE_SPOT_INSTANCE_DRAINING=true >> /etc/ecs/ecs.config
+  EOF
+  )
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "${var.name_tag}-ecs-instance"
+    }
+  }
+
+  monitoring {
+    enabled = true
+  }
+}
+
+# Auto Scaling Group with mixed instances
+resource "aws_autoscaling_group" "ecs" {
+  name                = local.asg_name
+  vpc_zone_identifier = aws_subnet.private_subnets[*].id
+  min_size            = var.min_tasks  # Minimum size is 1 for the on-demand instance
+  max_size            = var.max_tasks
+  desired_capacity    = var.min_tasks
+
+  mixed_instances_policy {
+    instances_distribution {
+      on_demand_base_capacity                  = 1         # 1 on-demand instance as base
+      on_demand_percentage_above_base_capacity = 0         # Rest are spot instances
+      spot_allocation_strategy                 = "capacity-optimized"
+      spot_instance_pools                      = 0         # Use with capacity-optimized strategy
+    }
+
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.ecs.id
+        version            = "$Latest"
+      }
+
+      # Optional: add instance type overrides for better spot availability
+      override {
+        instance_type = var.instance_type
+      }
+
+      # Add additional similar instance types for better spot availability
+      override {
+        instance_type = var.instance_type_alt1
+      }
+
+      override {
+        instance_type = var.instance_type_alt2
+      }
+    }
+  }
+
+  tag {
+    key                 = "AmazonECSManaged"
+    value               = ""
+    propagate_at_launch = true
+  }
+
+  protect_from_scale_in = true  # Let ECS manage instance termination
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_ecs_capacity_provider" "main" {
+  name = local.capacity_provider_name
+
+  auto_scaling_group_provider {
+    auto_scaling_group_arn         = aws_autoscaling_group.ecs.arn
+    managed_termination_protection = "ENABLED"
+
+    managed_scaling {
+      maximum_scaling_step_size = 2
+      minimum_scaling_step_size = 1
+      status                    = "ENABLED"
+      target_capacity           = 80  # Target 80% cluster utilization
+    }
+  }
+}
+
+resource "aws_ecs_cluster_capacity_providers" "cluster_capacity_providers" {
+  cluster_name       = aws_ecs_cluster.main.name
+  capacity_providers = [aws_ecs_capacity_provider.main.name]
+
+  default_capacity_provider_strategy {
+    capacity_provider = aws_ecs_capacity_provider.main.name
+    weight            = 100
+    base              = 1
   }
 }
 
 resource "aws_ecs_task_definition" "task" {
   family                   = local.ecs_task_definition_family
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
+  network_mode             = "bridge"  # Use bridge for EC2 launch type
+  requires_compatibilities = ["EC2"]
   execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
   task_role_arn            = aws_iam_role.ecs_task_role.arn
   cpu                      = var.task_cpu
@@ -269,7 +431,7 @@ resource "aws_ecs_task_definition" "task" {
       portMappings = [
         {
           containerPort = var.app_port
-          hostPort      = var.app_port
+          hostPort      = 0 #0  # Dynamic port mapping for EC2 launch type
           protocol      = "tcp"
         }
       ],
@@ -281,7 +443,7 @@ resource "aws_ecs_task_definition" "task" {
           awslogs-region        = var.region
           awslogs-stream-prefix = "ecs"
         }
-      }      
+      }
     }
   ])
 }
@@ -299,18 +461,19 @@ resource "aws_lb" "application_load_balancer" {
 }
 
 resource "aws_lb_target_group" "main" {
-  name       = local.aws_lb_target_group_name
-  port       = var.app_port
-  protocol   = "HTTP"
-  vpc_id     = aws_vpc.main.id
-  target_type = "ip"
+  name        = local.aws_lb_target_group_name
+  port        = var.app_port
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "instance"  # Change to instance for EC2 launch type
 
   health_check {
     path                = "/"
-    interval            = 10
+    interval            = 30
     timeout             = 5
     healthy_threshold   = 2
-    unhealthy_threshold = 2
+    unhealthy_threshold = 3
+    matcher             = "200-399"  # Acceptable HTTP response codes
   }
 
   tags = {
@@ -339,12 +502,10 @@ resource "aws_ecs_service" "service" {
   task_definition = aws_ecs_task_definition.task.arn
   desired_count   = var.min_tasks
 
-  launch_type = "FARGATE"
-
-  network_configuration {
-    subnets         = aws_subnet.private_subnets[*].id
-    security_groups = [aws_security_group.ecs_task_sg.id]
-    assign_public_ip = false
+  capacity_provider_strategy {
+    capacity_provider = aws_ecs_capacity_provider.main.name
+    weight            = 100
+    base              = 1
   }
 
   load_balancer {
@@ -352,30 +513,18 @@ resource "aws_ecs_service" "service" {
     container_name   = local.container_name
     container_port   = var.app_port
   }
-}
 
-resource "aws_appautoscaling_target" "ecs" {
-  max_capacity       = var.max_tasks
-  min_capacity       = var.min_tasks
-  resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.service.name}"
-  scalable_dimension = "ecs:service:DesiredCount"
-  service_namespace  = "ecs"
-}
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
 
-resource "aws_appautoscaling_policy" "scale_cpu" {
-  name               = "scale-cpu"
-  resource_id        = aws_appautoscaling_target.ecs.resource_id
-  scalable_dimension = aws_appautoscaling_target.ecs.scalable_dimension
-  service_namespace  = "ecs"
+  deployment_maximum_percent         = 200
+  deployment_minimum_healthy_percent = 100
 
-  policy_type = "TargetTrackingScaling"
-  target_tracking_scaling_policy_configuration {
-    target_value       = 70.0 # Adjust as needed
-    scale_in_cooldown  = 300
-    scale_out_cooldown = 300
-    predefined_metric_specification {
-      predefined_metric_type = "ECSServiceAverageCPUUtilization"
-    }
+  # We need to manage the autoscaling group separately
+  lifecycle {
+    ignore_changes = [desired_count]
   }
 }
 

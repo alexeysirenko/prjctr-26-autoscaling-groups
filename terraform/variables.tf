@@ -67,3 +67,18 @@ variable "log_level" {
   default     = "INFO"
   description = "App log level"
 }
+
+variable "instance_type" {
+  description = "EC2 instance type for ECS hosts"
+  default     = "t3.medium"
+}
+
+variable "instance_type_alt1" {
+  description = "Alternative EC2 instance type for better spot availability"
+  default     = "t3a.medium"
+}
+
+variable "instance_type_alt2" {
+  description = "Secondary alternative EC2 instance type for better spot availability"
+  default     = "m5.large"
+}
