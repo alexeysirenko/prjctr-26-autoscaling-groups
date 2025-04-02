@@ -381,22 +381,6 @@ resource "aws_autoscaling_group" "ecs" {
   }
 }
 
-resource "aws_ecs_capacity_provider" "main" {
-  name = local.capacity_provider_name
-
-  auto_scaling_group_provider {
-    auto_scaling_group_arn         = aws_autoscaling_group.ecs.arn
-    managed_termination_protection = "ENABLED"
-
-    managed_scaling {
-      maximum_scaling_step_size = 2
-      minimum_scaling_step_size = 1
-      status                    = "ENABLED"
-      target_capacity           = 80  # Target 80% cluster utilization
-    }
-  }
-}
-
 resource "aws_ecs_cluster_capacity_providers" "cluster_capacity_providers" {
   cluster_name       = aws_ecs_cluster.main.name
   capacity_providers = [aws_ecs_capacity_provider.main.name]
@@ -556,6 +540,87 @@ resource "aws_appautoscaling_policy" "cpu_scaling" {
     target_value       = 70.0  # Target CPU utilization percentage
     scale_in_cooldown  = 300   # 5 minutes
     scale_out_cooldown = 60    # 1 minute
+  }
+}
+
+resource "aws_appautoscaling_policy" "request_count_scaling" {
+  name               = "${var.name_tag}-request-count-scaling-policy"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.ecs_target.resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs_target.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs_target.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ALBRequestCountPerTarget"
+      resource_label         = "${aws_lb.application_load_balancer.arn_suffix}/${aws_lb_target_group.main.arn_suffix}"
+    }
+
+    target_value       = var.target_requests_per_instance
+    scale_in_cooldown  = 300  # 5 minutes - be conservative scaling in
+    scale_out_cooldown = 60   # 1 minute - scale out quickly
+  }
+}
+
+resource "aws_appautoscaling_policy" "high_request_scaling" {
+  name               = "${var.name_tag}-high-request-scaling-policy"
+  policy_type        = "StepScaling"
+  resource_id        = aws_appautoscaling_target.ecs_target.resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs_target.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs_target.service_namespace
+
+  step_scaling_policy_configuration {
+    adjustment_type         = "ChangeInCapacity"
+    cooldown                = 60
+    metric_aggregation_type = "Average"
+
+    step_adjustment {
+      metric_interval_lower_bound = 0
+      metric_interval_upper_bound = 2.0
+      scaling_adjustment          = 2
+    }
+
+    step_adjustment {
+      metric_interval_lower_bound = 2.0  # This is fine as is
+      scaling_adjustment          = 3
+    }
+  }
+}
+
+# CloudWatch alarm to trigger the step scaling policy
+resource "aws_cloudwatch_metric_alarm" "high_request_alarm" {
+  alarm_name          = "${var.name_tag}-high-request-count-alarm"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "RequestCountPerTarget"
+  namespace           = "AWS/ApplicationELB"
+  period              = 60
+  statistic           = "Average"
+  threshold           = var.target_requests_per_instance * 2  # Trigger when 2X the target
+  alarm_description   = "This metric monitors high request counts per target"
+  alarm_actions       = [aws_appautoscaling_policy.high_request_scaling.arn]
+
+  dimensions = {
+    LoadBalancer = aws_lb.application_load_balancer.arn_suffix
+    TargetGroup  = aws_lb_target_group.main.arn_suffix
+  }
+}
+
+# Capacity provider enhanced scaling configuration
+resource "aws_ecs_capacity_provider" "main" {
+  name = local.capacity_provider_name
+
+  auto_scaling_group_provider {
+    auto_scaling_group_arn         = aws_autoscaling_group.ecs.arn
+    managed_termination_protection = "ENABLED"
+
+    managed_scaling {
+      maximum_scaling_step_size = 5         # Allow bigger steps for rapid scaling
+      minimum_scaling_step_size = 1
+      status                    = "ENABLED"
+      target_capacity           = 90        # Higher target utilization
+      instance_warmup_period    = 120       # Seconds before new instance is considered by scaling
+    }
   }
 }
 

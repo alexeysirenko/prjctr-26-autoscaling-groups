@@ -82,3 +82,9 @@ variable "instance_type_alt2" {
   description = "Secondary alternative EC2 instance type for better spot availability"
   default     = "m5.large"
 }
+
+variable "target_requests_per_instance" {
+  description = "Target number of requests per instance"
+  type        = number
+  default     = 500
+}
